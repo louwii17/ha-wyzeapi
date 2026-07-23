@@ -1,21 +1,15 @@
 """Valve entities for Wyze sprinkler zones."""
 
-import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import timedelta
 import logging
 from typing import Any
 
 from aiohttp.client_exceptions import ClientConnectionError
-from wyzeapy import Wyzeapy
 from wyzeapy.exceptions import (
-    AccessTokenError,
-    LoginError,
     ParameterError,
     UnknownApiError,
 )
-from wyzeapy.services.irrigation_service import Irrigation, IrrigationService, Zone
+from wyzeapy.services.irrigation_service import Zone
 
 from homeassistant.components.valve import (
     ValveDeviceClass,
@@ -24,75 +18,23 @@ from homeassistant.components.valve import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
-    DataUpdateCoordinator,
-    UpdateFailed,
 )
 
-from .const import CONF_CLIENT, DOMAIN, IRRIGATION_UPDATED
+from .const import DOMAIN, IRRIGATION_UPDATED
+from .irrigation import (
+    WyzeIrrigationCoordinator,
+    async_get_irrigation_coordinators,
+)
 from .token_manager import token_exception_handler
 
 _LOGGER = logging.getLogger(__name__)
 ATTRIBUTION = "Data provided by Wyze"
-UPDATE_INTERVAL = timedelta(seconds=30)
-
-
-@dataclass
-class WyzeIrrigationRuntimeData:
-    """Latest state shared by all zones on an irrigation controller."""
-
-    device: Irrigation
-    running_zone_number: int | None
-
-
-class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]):
-    """Coordinate one status request for all zones on a controller."""
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        irrigation_service: IrrigationService,
-        device: Irrigation,
-    ) -> None:
-        """Initialize the irrigation coordinator."""
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=f"Wyze irrigation {device.mac}",
-            update_interval=UPDATE_INTERVAL,
-        )
-        self.irrigation_service = irrigation_service
-        self.device = device
-        self.command_lock = asyncio.Lock()
-
-    async def _async_update_data(self) -> WyzeIrrigationRuntimeData:
-        """Fetch controller, zone, and running-schedule state."""
-        try:
-            self.device = await self.irrigation_service.update(self.device)
-            schedule = await self.irrigation_service.get_schedule_runs(self.device)
-        except (AccessTokenError, LoginError) as err:
-            raise ConfigEntryAuthFailed(
-                "Unable to authenticate with Wyze; please reauthenticate"
-            ) from err
-        except Exception as err:
-            raise UpdateFailed(
-                f"Unable to update Wyze sprinkler {self.device.nickname}: {err}"
-            ) from err
-
-        running_zone_number = None
-        if schedule.get("running"):
-            running_zone_number = schedule.get("zone_number")
-
-        return WyzeIrrigationRuntimeData(self.device, running_zone_number)
-
-    def set_running_zone(self, zone_number: int | None) -> None:
-        """Optimistically update the active zone after a successful command."""
-        self.async_set_updated_data(WyzeIrrigationRuntimeData(self.device, zone_number))
 
 
 @token_exception_handler
@@ -102,13 +44,10 @@ async def async_setup_entry(
     async_add_entities: Callable[[list[Any], bool], None],
 ) -> None:
     """Set up Wyze sprinkler zone valves."""
-    client: Wyzeapy = hass.data[DOMAIN][config_entry.entry_id][CONF_CLIENT]
-    irrigation_service = await client.irrigation_service
-
     entities: list[WyzeIrrigationZoneValve] = []
-    for device in await irrigation_service.get_irrigations():
-        coordinator = WyzeIrrigationCoordinator(hass, irrigation_service, device)
-        await coordinator.async_config_entry_first_refresh()
+    coordinators = await async_get_irrigation_coordinators(hass, config_entry)
+    for coordinator in coordinators.values():
+        device = coordinator.data.device
         config_entry.async_on_unload(
             async_dispatcher_connect(
                 hass,
@@ -231,7 +170,7 @@ class WyzeIrrigationZoneValve(
                 f"Unable to start Wyze sprinkler zone {self._zone.name}: {err}"
             ) from err
 
-        self.coordinator.set_running_zone(self._zone.zone_number)
+        self.coordinator.set_running_zone(self._zone.zone_number, duration)
 
     @token_exception_handler
     async def async_close_valve(self) -> None:

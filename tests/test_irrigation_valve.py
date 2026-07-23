@@ -13,8 +13,8 @@ from homeassistant.exceptions import HomeAssistantError
 import pytest
 
 from custom_components.wyzeapi import PLATFORMS
+from custom_components.wyzeapi.irrigation import WyzeIrrigationRuntimeData
 from custom_components.wyzeapi.valve import (
-    WyzeIrrigationRuntimeData,
     WyzeIrrigationZoneValve,
 )
 
@@ -65,7 +65,7 @@ def coordinator(
     coordinator.irrigation_service = service
     coordinator.command_lock = asyncio.Lock()
 
-    def set_running_zone(zone_number: int | None) -> None:
+    def set_running_zone(zone_number: int | None, duration: int | None = None) -> None:
         coordinator.data = WyzeIrrigationRuntimeData(irrigation, zone_number)
 
     coordinator.set_running_zone.side_effect = set_running_zone
@@ -122,7 +122,7 @@ async def test_open_valve_uses_configured_duration(
 
     service.stop_running_schedule.assert_not_awaited()
     service.start_zone.assert_awaited_once_with(coordinator.device, 2, 900)
-    coordinator.set_running_zone.assert_called_once_with(2)
+    coordinator.set_running_zone.assert_called_once_with(2, 900)
     assert entity.is_closed is False
 
 
@@ -139,7 +139,10 @@ async def test_open_valve_stops_another_running_zone_first(
 
     service.stop_running_schedule.assert_awaited_once_with(coordinator.device)
     service.start_zone.assert_awaited_once_with(coordinator.device, 2, 900)
-    assert coordinator.set_running_zone.call_args_list == [call(None), call(2)]
+    assert coordinator.set_running_zone.call_args_list == [
+        call(None),
+        call(2, 900),
+    ]
 
 
 @pytest.mark.asyncio

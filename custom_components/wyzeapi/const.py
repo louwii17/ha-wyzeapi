@@ -2,6 +2,8 @@
 
 DOMAIN = "wyzeapi"
 CONF_CLIENT = "wyzeapi_client"
+CONF_IRRIGATION_COORDINATORS = "irrigation_coordinators"
+CONF_IRRIGATION_SETUP_LOCK = "irrigation_setup_lock"
 
 ACCESS_TOKEN = "access_token"
 REFRESH_TOKEN = "refresh_token"

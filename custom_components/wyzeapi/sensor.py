@@ -9,7 +9,7 @@ from typing import Any
 from wyzeapy import Wyzeapy
 from wyzeapy.services.air_purifier_service import AirPurifier
 from wyzeapy.services.camera_service import Camera
-from wyzeapy.services.irrigation_service import Irrigation, IrrigationService
+from wyzeapy.services.irrigation_service import Zone
 from wyzeapy.services.lock_service import Lock
 from wyzeapy.services.switch_service import Switch, SwitchUsageService
 
@@ -35,6 +35,7 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_change,
 )
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     AIR_PURIFIER_UPDATED,
@@ -43,6 +44,10 @@ from .const import (
     DOMAIN,
     LOCK_UPDATED,
     RESET_BUTTON_PRESSED,
+)
+from .irrigation import (
+    WyzeIrrigationCoordinator,
+    async_get_irrigation_coordinators,
 )
 from .token_manager import token_exception_handler
 
@@ -72,7 +77,6 @@ async def async_setup_entry(
     lock_service = await client.lock_service
     camera_service = await client.camera_service
     switch_usage_service = await client.switch_usage_service
-    irrigation_service = await client.irrigation_service
     air_purifier_service = await client.air_purifier_service
 
     locks = await lock_service.get_locks()
@@ -103,18 +107,22 @@ async def async_setup_entry(
         sensors.append(WyzeAirPurifierAQISensor(air_purifier))
         sensors.append(WyzeAirPurifierHourlyMaxAQISensor(air_purifier))
 
-    # Get all irrigation devices
-    irrigation_devices = await irrigation_service.get_irrigations()
-
     # Create sensor entities for each irrigation device
-    for device in irrigation_devices:
-        # Update the device to get its properties
-        device = await irrigation_service.update(device)
+    irrigation_coordinators = await async_get_irrigation_coordinators(
+        hass, config_entry
+    )
+    for coordinator in irrigation_coordinators.values():
+        device = coordinator.data.device
         sensors.extend(
             [
-                WyzeIrrigationRSSI(irrigation_service, device),
-                WyzeIrrigationIP(irrigation_service, device),
-                WyzeIrrigationSSID(irrigation_service, device),
+                WyzeIrrigationRSSI(coordinator),
+                WyzeIrrigationIP(coordinator),
+                WyzeIrrigationSSID(coordinator),
+                *(
+                    WyzeIrrigationZoneEndTime(coordinator, zone)
+                    for zone in device.zones
+                    if zone.enabled
+                ),
             ]
         )
 
@@ -520,18 +528,21 @@ class WyzePlugDailyEnergySensor(RestoreSensor):
         )
 
 
-class WyzeIrrigationBaseSensor(SensorEntity):
+class WyzeIrrigationBaseSensor(
+    CoordinatorEntity[WyzeIrrigationCoordinator], SensorEntity
+):
     """Base class for Wyze Irrigation sensors."""
 
     _attr_has_entity_name = True
-    _attr_should_poll = False
 
-    def __init__(
-        self, irrigation_service: IrrigationService, irrigation: Irrigation
-    ) -> None:
+    def __init__(self, coordinator: WyzeIrrigationCoordinator) -> None:
         """Initialize the irrigation base sensor."""
-        self._irrigation_service = irrigation_service
-        self._device = irrigation
+        super().__init__(coordinator)
+
+    @property
+    def _device(self) -> Any:
+        """Return the coordinator's latest device model."""
+        return self.coordinator.data.device
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -545,22 +556,51 @@ class WyzeIrrigationBaseSensor(SensorEntity):
             connections={(dr.CONNECTION_NETWORK_MAC, self._device.mac)},
         )
 
-    @callback
-    def async_update_callback(self, irrigation: Irrigation) -> None:
-        """Update the irrigation's state."""
-        self._device = self._irrigation_service.update_device_props(irrigation)
-        self.async_schedule_update_ha_state()
 
-    async def async_added_to_hass(self) -> None:
-        """Subscribe to updates."""
-        self._device.callback_function = self.async_update_callback
-        self._irrigation_service.register_updater(self._device, 30)
-        await self._irrigation_service.start_update_manager()
-        return await super().async_added_to_hass()
+class WyzeIrrigationZoneEndTime(
+    CoordinatorEntity[WyzeIrrigationCoordinator], SensorEntity
+):
+    """End time of the current quick run for a sprinkler zone."""
 
-    async def async_will_remove_from_hass(self) -> None:
-        """Clean up when removed."""
-        self._irrigation_service.unregister_updater(self._device)
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator: WyzeIrrigationCoordinator, zone: Zone) -> None:
+        """Initialize a zone end-time sensor."""
+        super().__init__(coordinator)
+        self._zone = zone
+        self._attr_name = f"{zone.name} end time"
+        self._attr_unique_id = (
+            f"{coordinator.device.mac}-zone-{zone.zone_number}-end-time"
+        )
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return information about the sprinkler controller."""
+        device = self.coordinator.device
+        return DeviceInfo(
+            identifiers={(DOMAIN, device.mac)},
+            name=device.nickname,
+            manufacturer="WyzeLabs",
+            model=device.product_model,
+            serial_number=device.sn,
+            connections={(dr.CONNECTION_NETWORK_MAC, device.mac)},
+        )
+
+    @property
+    def available(self) -> bool:
+        """Return whether the controller is available."""
+        return (
+            self.coordinator.last_update_success
+            and self.coordinator.data.device.available
+        )
+
+    @property
+    def native_value(self) -> datetime.datetime | None:
+        """Return the active run's end time for this zone."""
+        if self.coordinator.data.running_zone_number != self._zone.zone_number:
+            return None
+        return self.coordinator.data.run_end
 
 
 class WyzeIrrigationRSSI(WyzeIrrigationBaseSensor):
