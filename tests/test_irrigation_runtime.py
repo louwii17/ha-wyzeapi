@@ -82,6 +82,16 @@ def test_parse_schedules_enabled_handles_device_info_shapes() -> None:
         parse_schedules_enabled({"data": {"props": {"enable_schedules": True}}}) is True
     )
     assert parse_schedules_enabled({"data": {"enable_schedules": "0"}}) is False
+    assert (
+        parse_schedules_enabled(
+            {"data": {"properties": [{"key": "enable_schedules", "value": "enabled"}]}}
+        )
+        is True
+    )
+    assert (
+        parse_schedules_enabled({"data": '{"props": {"enable_schedules": false}}'})
+        is False
+    )
     assert parse_schedules_enabled({"data": {}}) is None
 
 

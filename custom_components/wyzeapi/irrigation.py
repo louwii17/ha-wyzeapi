@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import json
 import logging
 from time import time
 from typing import Any
@@ -84,13 +85,41 @@ def _boolean(value: Any) -> bool | None:
     return None
 
 
+def _find_property(value: Any, name: str) -> Any:
+    """Find a named property in nested Wyze response formats."""
+    if isinstance(value, Mapping):
+        if name in value:
+            return value[name]
+
+        property_name = value.get("key", value.get("name"))
+        if property_name == name and "value" in value:
+            return value["value"]
+
+        for nested_value in value.values():
+            result = _find_property(nested_value, name)
+            if result is not None:
+                return result
+        return None
+
+    if isinstance(value, list):
+        for nested_value in value:
+            result = _find_property(nested_value, name)
+            if result is not None:
+                return result
+        return None
+
+    if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+        try:
+            return _find_property(json.loads(value), name)
+        except json.JSONDecodeError:
+            return None
+
+    return None
+
+
 def parse_schedules_enabled(response: Mapping[str, Any]) -> bool | None:
     """Extract the schedule-enabled setting from a device-info response."""
-    data = response.get("data", {})
-    properties = data.get("props", data)
-    if not isinstance(properties, Mapping):
-        return None
-    return _boolean(properties.get("enable_schedules"))
+    return _boolean(_find_property(response.get("data"), "enable_schedules"))
 
 
 def derive_program_mode(
@@ -227,6 +256,12 @@ class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]
             return self._schedules_enabled
 
         self._schedules_enabled = parse_schedules_enabled(response)
+        if self._schedules_enabled is None:
+            _LOGGER.debug(
+                "Wyze sprinkler %s device-info data for enable_schedules: %s",
+                self.device.mac,
+                response.get("data"),
+            )
         self._device_info_refresh_at = now + DEVICE_INFO_INTERVAL.total_seconds()
         _LOGGER.debug(
             "Wyze sprinkler %s schedules enabled: %s",
