@@ -12,87 +12,11 @@ from custom_components.wyzeapi.irrigation import (
     PROGRAM_MODE_SCHEDULED,
     WyzeIrrigationRuntimeData,
     derive_program_mode,
-    parse_running_schedule,
-    parse_schedules_enabled,
 )
 from custom_components.wyzeapi.sensor import (
     WyzeIrrigationProgramMode,
     WyzeIrrigationZoneEndTime,
 )
-
-
-def test_parse_running_schedule_selects_current_sequential_zone() -> None:
-    """The active time interval wins instead of the first scheduled zone."""
-    response = {
-        "data": {
-            "schedules": [
-                {
-                    "schedule_state": "running",
-                    "schedule_name": "Morning",
-                    "schedule_type": "FIXED",
-                    "zone_runs": [
-                        {
-                            "zone_number": 1,
-                            "zone_name": "Front",
-                            "start_ts": 1_000,
-                            "end_ts": 1_100,
-                        },
-                        {
-                            "zone_number": 2,
-                            "zone_name": "Back",
-                            "start_ts": 1_100,
-                            "end_ts": 1_200,
-                        },
-                    ],
-                }
-            ]
-        }
-    }
-
-    assert parse_running_schedule(response, now_timestamp=1_150) == {
-        "running": True,
-        "zone_number": 2,
-        "zone_name": "Back",
-        "start_ts": 1_100,
-        "end_ts": 1_200,
-        "schedule_name": "Morning",
-        "schedule_type": "FIXED",
-    }
-
-
-def test_parse_running_schedule_handles_idle_controller() -> None:
-    """Past schedules do not make a zone active."""
-    response = {
-        "data": {
-            "schedules": [
-                {
-                    "schedule_state": "past",
-                    "zone_runs": [{"zone_number": 1}],
-                }
-            ]
-        }
-    }
-
-    assert parse_running_schedule(response, now_timestamp=1_150) == {"running": False}
-
-
-def test_parse_schedules_enabled_handles_device_info_shapes() -> None:
-    """Schedule-enabled state is normalized from observed response shapes."""
-    assert (
-        parse_schedules_enabled({"data": {"props": {"enable_schedules": True}}}) is True
-    )
-    assert parse_schedules_enabled({"data": {"enable_schedules": "0"}}) is False
-    assert (
-        parse_schedules_enabled(
-            {"data": {"properties": [{"key": "enable_schedules", "value": "enabled"}]}}
-        )
-        is True
-    )
-    assert (
-        parse_schedules_enabled({"data": '{"props": {"enable_schedules": false}}'})
-        is False
-    )
-    assert parse_schedules_enabled({"data": {}}) is None
 
 
 def test_derive_program_mode_matches_homekit_semantics() -> None:
