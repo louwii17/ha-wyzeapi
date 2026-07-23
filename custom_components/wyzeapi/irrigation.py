@@ -11,8 +11,12 @@ from time import time
 from typing import Any
 
 from wyzeapy import Wyzeapy
+from wyzeapy.const import APP_INFO, OLIVE_APP_ID, PHONE_ID
+from wyzeapy.crypto import olive_create_signature
 from wyzeapy.exceptions import AccessTokenError, LoginError
+from wyzeapy.payload_factory import olive_create_get_payload_irrigation
 from wyzeapy.services.irrigation_service import Irrigation, IrrigationService
+from wyzeapy.utils import check_for_errors_iot
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -192,14 +196,25 @@ class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]
         if now < self._device_info_refresh_at:
             return self._schedules_enabled
 
-        raw_getter = getattr(self.irrigation_service, "_get_iot_prop", None)
-        if raw_getter is None:
-            return self._schedules_enabled
-
         try:
-            response = await raw_getter(
-                DEVICE_INFO_URL, self.device, "enable_schedules"
+            auth_lib = self.irrigation_service._auth_lib
+            await auth_lib.refresh_if_should()
+            payload = olive_create_get_payload_irrigation(self.device.mac)
+            payload["keys"] = "enable_schedules"
+            signature = olive_create_signature(payload, auth_lib.token.access_token)
+            headers = {
+                "Accept-Encoding": "gzip",
+                "User-Agent": "myapp",
+                "appid": OLIVE_APP_ID,
+                "appinfo": APP_INFO,
+                "phoneid": PHONE_ID,
+                "access_token": auth_lib.token.access_token,
+                "signature2": signature,
+            }
+            response = await auth_lib.get(
+                DEVICE_INFO_URL, headers=headers, params=payload
             )
+            check_for_errors_iot(self.irrigation_service, response)
         except (AccessTokenError, LoginError):
             raise
         except Exception as err:
