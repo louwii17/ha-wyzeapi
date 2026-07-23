@@ -46,6 +46,9 @@ from .const import (
     RESET_BUTTON_PRESSED,
 )
 from .irrigation import (
+    PROGRAM_MODE_MANUAL,
+    PROGRAM_MODE_NONE,
+    PROGRAM_MODE_SCHEDULED,
     WyzeIrrigationCoordinator,
     async_get_irrigation_coordinators,
 )
@@ -118,6 +121,7 @@ async def async_setup_entry(
                 WyzeIrrigationRSSI(coordinator),
                 WyzeIrrigationIP(coordinator),
                 WyzeIrrigationSSID(coordinator),
+                WyzeIrrigationProgramMode(coordinator),
                 *(
                     WyzeIrrigationZoneEndTime(coordinator, zone)
                     for zone in device.zones
@@ -601,6 +605,36 @@ class WyzeIrrigationZoneEndTime(
         if self.coordinator.data.running_zone_number != self._zone.zone_number:
             return None
         return self.coordinator.data.run_end
+
+
+class WyzeIrrigationProgramMode(WyzeIrrigationBaseSensor):
+    """Current program mode for a Wyze sprinkler controller."""
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_name = "Program mode"
+    _attr_options = [
+        PROGRAM_MODE_NONE,
+        PROGRAM_MODE_SCHEDULED,
+        PROGRAM_MODE_MANUAL,
+    ]
+
+    @property
+    def unique_id(self) -> str:
+        """Return a unique ID for the program-mode sensor."""
+        return f"{self._device.mac}-program-mode"
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the HomeKit-aligned program mode."""
+        return self.coordinator.data.program_mode
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the Wyze values used to derive program mode."""
+        return {
+            "schedules_enabled": self.coordinator.data.schedules_enabled,
+            "schedule_type": self.coordinator.data.schedule_type,
+        }
 
 
 class WyzeIrrigationRSSI(WyzeIrrigationBaseSensor):

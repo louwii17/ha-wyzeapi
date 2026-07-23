@@ -30,9 +30,16 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL = timedelta(seconds=30)
+DEVICE_INFO_INTERVAL = timedelta(minutes=5)
 SCHEDULE_RUNS_URL = (
     "https://wyze-lockwood-service.wyzecam.com/plugin/irrigation/schedule_runs"
 )
+DEVICE_INFO_URL = (
+    "https://wyze-lockwood-service.wyzecam.com/plugin/irrigation/device_info"
+)
+PROGRAM_MODE_NONE = "none"
+PROGRAM_MODE_SCHEDULED = "scheduled"
+PROGRAM_MODE_MANUAL = "manual"
 
 
 @dataclass
@@ -46,6 +53,8 @@ class WyzeIrrigationRuntimeData:
     run_end: datetime | None = None
     schedule_name: str | None = None
     schedule_type: str | None = None
+    schedules_enabled: bool | None = None
+    program_mode: str | None = None
 
 
 def _timestamp(value: Any) -> int | None:
@@ -54,6 +63,43 @@ def _timestamp(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _boolean(value: Any) -> bool | None:
+    """Return a normalized boolean from an API value."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.casefold()
+        if normalized in {"1", "true", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "off", "disabled"}:
+            return False
+    return None
+
+
+def parse_schedules_enabled(response: Mapping[str, Any]) -> bool | None:
+    """Extract the schedule-enabled setting from a device-info response."""
+    data = response.get("data", {})
+    properties = data.get("props", data)
+    if not isinstance(properties, Mapping):
+        return None
+    return _boolean(properties.get("enable_schedules"))
+
+
+def derive_program_mode(
+    schedule_type: str | None, schedules_enabled: bool | None
+) -> str | None:
+    """Translate Wyze schedule state to HomeKit-aligned program modes."""
+    if schedule_type and schedule_type.casefold() == PROGRAM_MODE_MANUAL:
+        return PROGRAM_MODE_MANUAL
+    if schedule_type or schedules_enabled:
+        return PROGRAM_MODE_SCHEDULED
+    if schedules_enabled is False:
+        return PROGRAM_MODE_NONE
+    return None
 
 
 def parse_running_schedule(
@@ -119,6 +165,8 @@ class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]
         self.irrigation_service = irrigation_service
         self.device = device
         self.command_lock = asyncio.Lock()
+        self._schedules_enabled: bool | None = None
+        self._device_info_refresh_at = 0.0
 
     async def _async_get_schedule(self) -> dict[str, Any]:
         """Fetch the raw schedule response so timestamps are not discarded."""
@@ -138,11 +186,46 @@ class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]
         )
         return schedule
 
+    async def _async_get_schedules_enabled(self) -> bool | None:
+        """Return the cached controller schedule-enabled setting."""
+        now = time()
+        if now < self._device_info_refresh_at:
+            return self._schedules_enabled
+
+        raw_getter = getattr(self.irrigation_service, "_get_iot_prop", None)
+        if raw_getter is None:
+            return self._schedules_enabled
+
+        try:
+            response = await raw_getter(
+                DEVICE_INFO_URL, self.device, "enable_schedules"
+            )
+        except (AccessTokenError, LoginError):
+            raise
+        except Exception as err:
+            self._device_info_refresh_at = now + DEVICE_INFO_INTERVAL.total_seconds()
+            _LOGGER.warning(
+                "Unable to fetch schedule state for Wyze sprinkler %s: %s",
+                self.device.mac,
+                err,
+            )
+            return self._schedules_enabled
+
+        self._schedules_enabled = parse_schedules_enabled(response)
+        self._device_info_refresh_at = now + DEVICE_INFO_INTERVAL.total_seconds()
+        _LOGGER.debug(
+            "Wyze sprinkler %s schedules enabled: %s",
+            self.device.mac,
+            self._schedules_enabled,
+        )
+        return self._schedules_enabled
+
     async def _async_update_data(self) -> WyzeIrrigationRuntimeData:
         """Fetch controller, zone, and running-schedule state."""
         try:
             self.device = await self.irrigation_service.update(self.device)
             schedule = await self._async_get_schedule()
+            schedules_enabled = await self._async_get_schedules_enabled()
         except (AccessTokenError, LoginError) as err:
             raise ConfigEntryAuthFailed(
                 "Unable to authenticate with Wyze; please reauthenticate"
@@ -152,8 +235,21 @@ class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]
                 f"Unable to update Wyze sprinkler {self.device.nickname}: {err}"
             ) from err
 
+        schedule_type = schedule.get("schedule_type")
+        program_mode = derive_program_mode(schedule_type, schedules_enabled)
+        _LOGGER.debug(
+            "Wyze sprinkler %s program mode: %s",
+            self.device.mac,
+            program_mode,
+        )
+
         if not schedule.get("running"):
-            return WyzeIrrigationRuntimeData(self.device, None)
+            return WyzeIrrigationRuntimeData(
+                device=self.device,
+                running_zone_number=None,
+                schedules_enabled=schedules_enabled,
+                program_mode=program_mode,
+            )
 
         start_ts = schedule.get("start_ts")
         end_ts = schedule.get("end_ts")
@@ -166,7 +262,9 @@ class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]
             ),
             run_end=dt_util.utc_from_timestamp(end_ts) if end_ts is not None else None,
             schedule_name=schedule.get("schedule_name"),
-            schedule_type=schedule.get("schedule_type"),
+            schedule_type=schedule_type,
+            schedules_enabled=schedules_enabled,
+            program_mode=program_mode,
         )
 
     def set_running_zone(
@@ -174,9 +272,22 @@ class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]
     ) -> None:
         """Optimistically update the active zone after a successful command."""
         if zone_number is None:
-            self.async_set_updated_data(WyzeIrrigationRuntimeData(self.device, None))
+            schedules_enabled = (
+                self.data.schedules_enabled if self.data is not None else None
+            )
+            self.async_set_updated_data(
+                WyzeIrrigationRuntimeData(
+                    device=self.device,
+                    running_zone_number=None,
+                    schedules_enabled=schedules_enabled,
+                    program_mode=derive_program_mode(None, schedules_enabled),
+                )
+            )
             return
 
+        schedules_enabled = (
+            self.data.schedules_enabled if self.data is not None else None
+        )
         run_start = dt_util.utcnow()
         run_end = (
             run_start + timedelta(seconds=duration) if duration is not None else None
@@ -187,7 +298,9 @@ class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]
                 running_zone_number=zone_number,
                 run_start=run_start,
                 run_end=run_end,
-                schedule_type="manual",
+                schedule_type="MANUAL",
+                schedules_enabled=schedules_enabled,
+                program_mode=PROGRAM_MODE_MANUAL,
             )
         )
 
