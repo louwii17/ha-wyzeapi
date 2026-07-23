@@ -19,17 +19,17 @@ from homeassistant.components.valve import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import device_registry as dr, entity_registry as er
-from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
 )
 
-from .const import DOMAIN, IRRIGATION_UPDATED
+from .const import DOMAIN
 from .irrigation import (
     WyzeIrrigationCoordinator,
     async_get_irrigation_coordinators,
+    get_quickrun_duration,
 )
 from .token_manager import token_exception_handler
 
@@ -47,14 +47,6 @@ async def async_setup_entry(
     entities: list[WyzeIrrigationZoneValve] = []
     coordinators = await async_get_irrigation_coordinators(hass, config_entry)
     for coordinator in coordinators.values():
-        device = coordinator.data.device
-        config_entry.async_on_unload(
-            async_dispatcher_connect(
-                hass,
-                f"{IRRIGATION_UPDATED}-{device.mac}",
-                coordinator.set_running_zone,
-            )
-        )
         entities.extend(
             WyzeIrrigationZoneValve(coordinator, zone)
             for zone in coordinator.data.device.zones
@@ -123,22 +115,7 @@ class WyzeIrrigationZoneValve(
 
     def _quickrun_duration(self) -> int:
         """Return the configured quick-run duration in seconds."""
-        unique_id = (
-            f"{self.coordinator.device.mac}-zone-"
-            f"{self._zone.zone_number}-quickrun-duration"
-        )
-        entity_id = er.async_get(self.hass).async_get_entity_id(
-            "number", DOMAIN, unique_id
-        )
-        if entity_id and (state := self.hass.states.get(entity_id)) is not None:
-            try:
-                duration = int(float(state.state) * 60)
-            except (TypeError, ValueError):
-                duration = 0
-            if duration > 0:
-                return duration
-
-        return self._zone.quickrun_duration
+        return get_quickrun_duration(self.hass, self.coordinator, self._zone)
 
     @token_exception_handler
     async def async_open_valve(self) -> None:
@@ -150,27 +127,16 @@ class WyzeIrrigationZoneValve(
             )
 
         try:
-            async with self.coordinator.command_lock:
-                running_zone = self.coordinator.data.running_zone_number
-                if running_zone is not None and running_zone != self._zone.zone_number:
-                    await self.coordinator.irrigation_service.stop_running_schedule(
-                        self.coordinator.device
-                    )
-                    self.coordinator.set_running_zone(None)
-
-                await self.coordinator.irrigation_service.start_zone(
-                    self.coordinator.device,
-                    self._zone.zone_number,
-                    duration,
-                )
+            await self.coordinator.async_start_zone(
+                self._zone.zone_number,
+                duration,
+            )
         except (ParameterError, UnknownApiError) as err:
             raise HomeAssistantError(f"Wyze returned an error: {err.args}") from err
         except ClientConnectionError as err:
             raise HomeAssistantError(
                 f"Unable to start Wyze sprinkler zone {self._zone.name}: {err}"
             ) from err
-
-        self.coordinator.set_running_zone(self._zone.zone_number, duration)
 
     @token_exception_handler
     async def async_close_valve(self) -> None:
@@ -179,17 +145,10 @@ class WyzeIrrigationZoneValve(
             return
 
         try:
-            async with self.coordinator.command_lock:
-                if self.is_closed:
-                    return
-                await self.coordinator.irrigation_service.stop_running_schedule(
-                    self.coordinator.device
-                )
+            await self.coordinator.async_stop(self._zone.zone_number)
         except (ParameterError, UnknownApiError) as err:
             raise HomeAssistantError(f"Wyze returned an error: {err.args}") from err
         except ClientConnectionError as err:
             raise HomeAssistantError(
                 f"Unable to stop Wyze sprinkler zone {self._zone.name}: {err}"
             ) from err
-
-        self.coordinator.set_running_zone(None)

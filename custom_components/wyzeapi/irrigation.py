@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import logging
-from time import time
+from time import monotonic
 
 from wyzeapy import Wyzeapy
 from wyzeapy.exceptions import AccessTokenError, LoginError
@@ -14,11 +14,13 @@ from wyzeapy.services.irrigation_service import (
     Irrigation,
     IrrigationRun,
     IrrigationService,
+    Zone,
 )
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -66,12 +68,32 @@ def derive_program_mode(
     return None
 
 
+def get_quickrun_duration(
+    hass: HomeAssistant,
+    coordinator: WyzeIrrigationCoordinator,
+    zone: Zone,
+) -> int:
+    """Return a zone's configured Home Assistant quick-run duration."""
+    unique_id = f"{coordinator.device.mac}-zone-{zone.zone_number}-quickrun-duration"
+    entity_id = er.async_get(hass).async_get_entity_id("number", DOMAIN, unique_id)
+    if entity_id and (state := hass.states.get(entity_id)) is not None:
+        try:
+            duration = int(float(state.state) * 60)
+        except (TypeError, ValueError):
+            duration = 0
+        if duration > 0:
+            return duration
+
+    return zone.quickrun_duration
+
+
 class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]):
     """Coordinate one status request for all zones on a controller."""
 
     def __init__(
         self,
         hass: HomeAssistant,
+        config_entry: ConfigEntry,
         irrigation_service: IrrigationService,
         device: Irrigation,
     ) -> None:
@@ -79,6 +101,7 @@ class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=f"Wyze irrigation {device.mac}",
             update_interval=UPDATE_INTERVAL,
         )
@@ -103,7 +126,7 @@ class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]
 
     async def _async_get_schedules_enabled(self) -> bool | None:
         """Return the cached controller schedule-enabled setting."""
-        now = time()
+        now = monotonic()
         if now < self._device_info_refresh_at:
             return self._schedules_enabled
 
@@ -182,6 +205,32 @@ class WyzeIrrigationCoordinator(DataUpdateCoordinator[WyzeIrrigationRuntimeData]
             program_mode=program_mode,
         )
 
+    async def async_start_zone(self, zone_number: int, duration: int) -> None:
+        """Start one zone while enforcing the controller's single-zone limit."""
+        async with self.command_lock:
+            running_zone = self.data.running_zone_number
+            if running_zone is not None and running_zone != zone_number:
+                await self.irrigation_service.stop_running_schedule(self.device)
+                self.set_running_zone(None)
+
+            await self.irrigation_service.start_zone(
+                self.device,
+                zone_number,
+                duration,
+            )
+            self.set_running_zone(zone_number, duration)
+
+    async def async_stop(self, expected_zone_number: int | None = None) -> None:
+        """Stop the controller run if the expected zone is still active."""
+        async with self.command_lock:
+            if (
+                expected_zone_number is not None
+                and self.data.running_zone_number != expected_zone_number
+            ):
+                return
+            await self.irrigation_service.stop_running_schedule(self.device)
+            self.set_running_zone(None)
+
     def set_running_zone(
         self, zone_number: int | None, duration: int | None = None
     ) -> None:
@@ -225,18 +274,27 @@ async def async_get_irrigation_coordinators(
 ) -> dict[str, WyzeIrrigationCoordinator]:
     """Return shared sprinkler coordinators for a config entry."""
     entry_data = hass.data[DOMAIN][config_entry.entry_id]
-    coordinators = entry_data.setdefault(CONF_IRRIGATION_COORDINATORS, {})
     lock = entry_data.setdefault(CONF_IRRIGATION_SETUP_LOCK, asyncio.Lock())
 
     async with lock:
-        if coordinators:
+        if coordinators := entry_data.get(CONF_IRRIGATION_COORDINATORS):
             return coordinators
+        if CONF_IRRIGATION_COORDINATORS in entry_data:
+            return entry_data[CONF_IRRIGATION_COORDINATORS]
 
         client: Wyzeapy = entry_data[CONF_CLIENT]
         irrigation_service = await client.irrigation_service
+        coordinators: dict[str, WyzeIrrigationCoordinator] = {}
         for device in await irrigation_service.get_irrigations():
-            coordinator = WyzeIrrigationCoordinator(hass, irrigation_service, device)
+            coordinator = WyzeIrrigationCoordinator(
+                hass,
+                config_entry,
+                irrigation_service,
+                device,
+            )
             await coordinator.async_config_entry_first_refresh()
             coordinators[device.mac] = coordinator
+
+        entry_data[CONF_IRRIGATION_COORDINATORS] = coordinators
 
     return coordinators

@@ -6,7 +6,8 @@ from typing import Any
 
 from aiohttp.client_exceptions import ClientConnectionError
 from wyzeapy import Wyzeapy
-from wyzeapy.services.irrigation_service import Irrigation, IrrigationService
+from wyzeapy.exceptions import ParameterError, UnknownApiError
+from wyzeapy.services.irrigation_service import Zone
 from wyzeapy.services.switch_service import Switch
 
 from homeassistant.components.button import ButtonDeviceClass, ButtonEntity
@@ -18,7 +19,12 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_registry import EntityCategory
 
-from .const import CONF_CLIENT, DOMAIN, IRRIGATION_UPDATED, RESET_BUTTON_PRESSED
+from .const import CONF_CLIENT, DOMAIN, RESET_BUTTON_PRESSED
+from .irrigation import (
+    WyzeIrrigationCoordinator,
+    async_get_irrigation_coordinators,
+    get_quickrun_duration,
+)
 from .token_manager import token_exception_handler
 
 _LOGGER = logging.getLogger(__name__)
@@ -42,16 +48,19 @@ async def async_setup_entry(
 
     _LOGGER.debug("""Creating new Wyze button component""")
     client: Wyzeapy = hass.data[DOMAIN][config_entry.entry_id][CONF_CLIENT]
-    irrigation_service = await client.irrigation_service
     switch_service = await client.switch_service
 
-    # Get all irrigation devices
-    irrigation_devices = await irrigation_service.get_irrigations()
-
     buttons = []
-    for device in irrigation_devices:
-        device = await irrigation_service.update(device)
-        buttons.append(WyzeIrrigationStopAllButton(irrigation_service, device))
+    irrigation_coordinators = await async_get_irrigation_coordinators(
+        hass, config_entry
+    )
+    for coordinator in irrigation_coordinators.values():
+        buttons.extend(
+            WyzeIrrigationZoneButton(coordinator, zone)
+            for zone in coordinator.data.device.zones
+            if zone.enabled
+        )
+        buttons.append(WyzeIrrigationStopAllButton(coordinator))
 
     plugs = await switch_service.get_switches()
     buttons.extend(
@@ -65,33 +74,98 @@ async def async_setup_entry(
     async_add_entities(buttons, True)
 
 
+class WyzeIrrigationZoneButton(ButtonEntity):
+    """Legacy sprinkler start button retained for existing automations."""
+
+    _attr_entity_registry_enabled_default = False
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:sprinkler"
+
+    def __init__(
+        self,
+        coordinator: WyzeIrrigationCoordinator,
+        zone: Zone,
+    ) -> None:
+        """Initialize the legacy irrigation zone button."""
+        self._coordinator = coordinator
+        self._zone = zone
+        self._attr_name = zone.name
+        self._attr_unique_id = f"Start {coordinator.device.mac}-zone-{zone.zone_number}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Return information about the sprinkler controller."""
+        device = self._coordinator.device
+        return DeviceInfo(
+            identifiers={(DOMAIN, device.mac)},
+            name=device.nickname,
+            manufacturer="WyzeLabs",
+            model=device.product_model,
+            serial_number=device.sn,
+            connections={(dr.CONNECTION_NETWORK_MAC, device.mac)},
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return details retained by the legacy entity."""
+        return {
+            "zone_number": self._zone.zone_number,
+            "zone_id": self._zone.zone_id,
+            "enabled": self._zone.enabled,
+            "quickrun_duration": get_quickrun_duration(
+                self.hass,
+                self._coordinator,
+                self._zone,
+            ),
+        }
+
+    @token_exception_handler
+    async def async_press(self) -> None:
+        """Start this zone using the configured quick-run duration."""
+        duration = get_quickrun_duration(self.hass, self._coordinator, self._zone)
+        if duration <= 0:
+            raise HomeAssistantError(
+                f"Invalid quick-run duration for zone {self._zone.name}"
+            )
+
+        try:
+            await self._coordinator.async_start_zone(
+                self._zone.zone_number,
+                duration,
+            )
+        except (ParameterError, UnknownApiError) as err:
+            raise HomeAssistantError(f"Wyze returned an error: {err.args}") from err
+        except ClientConnectionError as err:
+            raise HomeAssistantError(
+                f"Unable to start Wyze sprinkler zone {self._zone.name}: {err}"
+            ) from err
+
+
 class WyzeIrrigationStopAllButton(ButtonEntity):
     """Representation of a Wyze Irrigation Stop All Schedules Button."""
 
     _attr_name = "Stop All Zones"
 
-    def __init__(
-        self, irrigation_service: IrrigationService, irrigation: Irrigation
-    ) -> None:
+    def __init__(self, coordinator: WyzeIrrigationCoordinator) -> None:
         """Initialize the irrigation stop all button."""
-        self._irrigation_service = irrigation_service
-        self._device = irrigation
+        self._coordinator = coordinator
 
     @property
     def unique_id(self) -> str:
         """Return a unique ID for the button."""
-        return f"Stop All {self._device.mac}"
+        return f"Stop All {self._coordinator.device.mac}"
 
     @property
     def device_info(self) -> DeviceInfo:
         """Return device information about this entity."""
+        device = self._coordinator.device
         return DeviceInfo(
-            identifiers={(DOMAIN, self._device.mac)},
-            name=self._device.nickname,
+            identifiers={(DOMAIN, device.mac)},
+            name=device.nickname,
             manufacturer="WyzeLabs",
-            model=self._device.product_model,
-            serial_number=self._device.sn,
-            connections={(dr.CONNECTION_NETWORK_MAC, self._device.mac)},
+            model=device.product_model,
+            serial_number=device.sn,
+            connections={(dr.CONNECTION_NETWORK_MAC, device.mac)},
         )
 
     @property
@@ -114,16 +188,10 @@ class WyzeIrrigationStopAllButton(ButtonEntity):
             HomeAssistantError: If the schedules cannot be stopped.
         """
         try:
-            await self._irrigation_service.stop_running_schedule(self._device)
-            async_dispatcher_send(
-                self.hass,
-                f"{IRRIGATION_UPDATED}-{self._device.mac}",
-                None,
-            )
+            await self._coordinator.async_stop()
+        except (ParameterError, UnknownApiError) as err:
+            raise HomeAssistantError(f"Wyze returned an error: {err.args}") from err
         except ClientConnectionError as err:
-            raise HomeAssistantError(f"Failed to stop schedules: {err}") from err
-        except Exception as err:
-            _LOGGER.error("Error stopping schedules: %s", err)
             raise HomeAssistantError(f"Failed to stop schedules: {err}") from err
 
 

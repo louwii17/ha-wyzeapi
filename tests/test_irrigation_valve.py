@@ -1,8 +1,7 @@
 """Tests for Wyze sprinkler zone valve entities."""
 
-import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock
 
 from aiohttp.client_exceptions import ClientConnectionError
 from homeassistant.components.valve import (
@@ -44,31 +43,28 @@ def zone() -> SimpleNamespace:
 
 
 @pytest.fixture
-def service() -> SimpleNamespace:
-    """Return a mocked irrigation service."""
-    return SimpleNamespace(
-        start_zone=AsyncMock(),
-        stop_running_schedule=AsyncMock(),
-    )
-
-
-@pytest.fixture
 def coordinator(
     irrigation: SimpleNamespace,
-    service: SimpleNamespace,
 ) -> Mock:
     """Return a mocked irrigation coordinator."""
     coordinator = Mock()
     coordinator.device = irrigation
     coordinator.data = WyzeIrrigationRuntimeData(irrigation, None)
     coordinator.last_update_success = True
-    coordinator.irrigation_service = service
-    coordinator.command_lock = asyncio.Lock()
 
-    def set_running_zone(zone_number: int | None, duration: int | None = None) -> None:
+    async def async_start_zone(zone_number: int, duration: int) -> None:
         coordinator.data = WyzeIrrigationRuntimeData(irrigation, zone_number)
 
-    coordinator.set_running_zone.side_effect = set_running_zone
+    async def async_stop(expected_zone_number: int | None = None) -> None:
+        if (
+            expected_zone_number is not None
+            and coordinator.data.running_zone_number != expected_zone_number
+        ):
+            return
+        coordinator.data = WyzeIrrigationRuntimeData(irrigation, None)
+
+    coordinator.async_start_zone = AsyncMock(side_effect=async_start_zone)
+    coordinator.async_stop = AsyncMock(side_effect=async_stop)
     return coordinator
 
 
@@ -115,49 +111,39 @@ def test_state_and_device_information(
 async def test_open_valve_uses_configured_duration(
     entity: WyzeIrrigationZoneValve,
     coordinator: Mock,
-    service: SimpleNamespace,
 ) -> None:
     """Opening a zone starts it for the configured quick-run duration."""
     await entity.async_open_valve()
 
-    service.stop_running_schedule.assert_not_awaited()
-    service.start_zone.assert_awaited_once_with(coordinator.device, 2, 900)
-    coordinator.set_running_zone.assert_called_once_with(2, 900)
+    coordinator.async_start_zone.assert_awaited_once_with(2, 900)
     assert entity.is_closed is False
 
 
 @pytest.mark.asyncio
-async def test_open_valve_stops_another_running_zone_first(
+async def test_open_valve_delegates_when_another_zone_is_running(
     entity: WyzeIrrigationZoneValve,
     coordinator: Mock,
-    service: SimpleNamespace,
 ) -> None:
-    """Only one zone runs at a time."""
+    """The shared coordinator enforces the controller's single-zone limit."""
     coordinator.data = WyzeIrrigationRuntimeData(coordinator.device, 1)
 
     await entity.async_open_valve()
 
-    service.stop_running_schedule.assert_awaited_once_with(coordinator.device)
-    service.start_zone.assert_awaited_once_with(coordinator.device, 2, 900)
-    assert coordinator.set_running_zone.call_args_list == [
-        call(None),
-        call(2, 900),
-    ]
+    coordinator.async_start_zone.assert_awaited_once_with(2, 900)
+    assert entity.is_closed is False
 
 
 @pytest.mark.asyncio
 async def test_close_active_valve_uses_global_stop(
     entity: WyzeIrrigationZoneValve,
     coordinator: Mock,
-    service: SimpleNamespace,
 ) -> None:
     """Closing the active zone uses the controller's global stop operation."""
     coordinator.data = WyzeIrrigationRuntimeData(coordinator.device, 2)
 
     await entity.async_close_valve()
 
-    service.stop_running_schedule.assert_awaited_once_with(coordinator.device)
-    coordinator.set_running_zone.assert_called_once_with(None)
+    coordinator.async_stop.assert_awaited_once_with(2)
     assert entity.is_closed is True
 
 
@@ -165,28 +151,24 @@ async def test_close_active_valve_uses_global_stop(
 async def test_close_inactive_valve_is_a_noop(
     entity: WyzeIrrigationZoneValve,
     coordinator: Mock,
-    service: SimpleNamespace,
 ) -> None:
     """Closing an inactive zone does not stop the active zone."""
     coordinator.data = WyzeIrrigationRuntimeData(coordinator.device, 1)
 
     await entity.async_close_valve()
 
-    service.stop_running_schedule.assert_not_awaited()
-    coordinator.set_running_zone.assert_not_called()
+    coordinator.async_stop.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_api_failure_preserves_confirmed_state(
     entity: WyzeIrrigationZoneValve,
     coordinator: Mock,
-    service: SimpleNamespace,
 ) -> None:
     """A failed start does not publish optimistic running state."""
-    service.start_zone.side_effect = ClientConnectionError("offline")
+    coordinator.async_start_zone.side_effect = ClientConnectionError("offline")
 
     with pytest.raises(HomeAssistantError):
         await entity.async_open_valve()
 
-    coordinator.set_running_zone.assert_not_called()
     assert entity.is_closed is True
